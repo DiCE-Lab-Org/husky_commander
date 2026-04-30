@@ -21,3 +21,6 @@ Pose protocol uses `frame_id` field: `grip_start` (lock anchor), `delta` (offset
 ## Run
 
 Usually launched via [husky_bringup](https://github.com/DiCE-Lab-Org/husky_bringup):
+```
+ros2 launch husky_bringup husky.launch.py
+```
