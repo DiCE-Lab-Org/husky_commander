@@ -1,6 +1,6 @@
 // arm_teleop_node.cpp
 //
-// VR teleoperation controller for Husky A200 dual UR5e arms (Servo version).
+// VR teleoperation controller for Husky A200 dual UR5e arms (Servo + position-error version).
 //
 // Subscribes to PoseStamped delta messages from Unity (one per arm) and
 // commands each arm via MoveIt Servo using TwistStamped velocity messages.
@@ -11,17 +11,23 @@
 //   - Unity sends header.frame_id == "grip_start" with zero pose -> we
 //     snapshot the arm's current end-effector pose as the anchor.
 //   - Subsequent messages carry the user's TOTAL hand offset since grip_start.
-//     We compute the delta between consecutive offsets, divide by dt,
-//     and publish the resulting Cartesian velocity to Servo.
+//     We compute the target pose (anchor + offset), then derive a velocity
+//     by computing position error vs the arm's CURRENT EE pose, multiplied
+//     by a P-gain. This is a simple proportional position controller built
+//     on top of Servo's velocity interface.
 //   - Unity sends header.frame_id == "grip_end" -> we publish a zero twist
 //     and stop accepting deltas until the next grip_start.
 //
-// Compared to the previous Cartesian-path version this avoids:
-//   - computeCartesianPath partial-completion gating
-//   - MoveIt's plan-execute round-trip latency
-//   - start-state-deviation aborts caused by stale queued executions
-// Servo handles IK, singularity slowdown, joint-limit enforcement, and
-// optional collision checking continuously at its inner loop rate (200 Hz).
+// Why position-error instead of (target - last_target) / dt:
+//   With dt-based twist, each VR frame produces a twist that Servo applies
+//   for ONE Servo cycle (5ms), so the arm only covers ~15% of the distance
+//   the operator's hand covered in that VR frame. Result: arm always lags
+//   behind hand position.
+//
+//   With position-error twist, the arm continuously chases the target. As
+//   long as the operator holds their hand out, the arm keeps moving toward
+//   that hand position. When the arm catches up, the error shrinks and the
+//   velocity tapers to zero. Position-faithful by construction.
 
 #include <atomic>
 #include <chrono>
@@ -53,19 +59,19 @@ using Trigger = std_srvs::srv::Trigger;
 using std::placeholders::_1;
 
 
-// Maximum Cartesian linear / angular velocity magnitudes we will publish to Servo,
-// no matter how fast the operator's hand moves. Servo will clamp anyway via its
-// scale.linear / scale.rotational params, but pre-clamping here gives us cleaner
-// numbers and avoids saturation surprises.
-constexpr double MAX_LINEAR_VEL = 0.5;   // m/s
-constexpr double MAX_ANGULAR_VEL = 1.5;  // rad/s
+// P-gains for the position-error -> velocity conversion.
+// Higher = more aggressive chasing of the target, more responsive but more
+// likely to oscillate. Lower = sluggish but stable.
+// Start with these values; raise GAIN_LINEAR if the arm feels slow to catch up.
+constexpr double GAIN_LINEAR = 3.0;   // 1/s (so 1cm error -> 3cm/s velocity)
+constexpr double GAIN_ANGULAR = 4.0;  // 1/s
 
-// If Unity ever pauses (e.g. a frame drop), dt could spike to multi-second values
-// and a tiny pose change would compute a tiny twist, but a real-world pose jump
-// during a long dt would compute a HUGE twist. Clamp dt so we never compute
-// runaway velocities from large gaps.
-constexpr double MAX_DT_SECONDS = 0.2;
-constexpr double MIN_DT_SECONDS = 0.005;
+// Hard caps on the velocity we publish, regardless of how big the error is.
+// These dominate when the operator suddenly moves their hand a long way.
+// Servo will also clamp at its scale.linear / scale.rotational params, but
+// pre-clamping here gives us cleaner numbers.
+constexpr double MAX_LINEAR_VEL = 1.5;   // m/s
+constexpr double MAX_ANGULAR_VEL = 3.0;  // rad/s
 
 
 class ArmController
@@ -89,12 +95,11 @@ public:
       servo_namespace_(servo_namespace),
       ee_frame_(ee_frame),
       anchor_set_(false),
-      have_last_target_(false),
-      last_target_time_(node_->now()),
       gripper_busy_(false)
     {
-        // Use MoveGroupInterface only for the gripper and for the initial pose snapshot
-        // at grip_start. Streaming arm motion goes through Servo, not MGI.
+        // Use MoveGroupInterface only for the gripper, for the initial pose
+        // snapshot at grip_start, and for reading the arm's current EE pose
+        // every delta callback. Streaming arm motion goes through Servo.
         arm_ = std::make_shared<MoveGroupInterface>(node_, arm_group_name_);
         arm_->setMaxVelocityScalingFactor(velocity_scale);
         arm_->setMaxAccelerationScalingFactor(accel_scale);
@@ -155,7 +160,6 @@ private:
         auto client = node_->create_client<Trigger>(
             servo_namespace_ + "/start_servo");
 
-        // Run wait_for_service in a detached thread so we don't block construction.
         std::thread([this, client]() {
             for (int i = 0; i < 30; ++i) {
                 if (client->wait_for_service(std::chrono::seconds(1))) {
@@ -174,25 +178,29 @@ private:
     }
 
     // -----------------------------------------------------------------
-    // Compute a Cartesian twist that, applied for one publish_period, would
-    // move from `from` to `to`. This is what we publish to Servo.
+    // Compute a Cartesian twist proportional to the position error between
+    // the target pose and the arm's current pose.
     //
-    // Linear part: simple position difference / dt.
-    // Angular part: rotation that takes from-orientation to to-orientation,
-    //   converted to angular velocity vector.
+    //   linear_velocity  = (target_pos - current_pos) * GAIN_LINEAR
+    //   angular_velocity = axis_angle(target_orient * inv(current_orient))
+    //                       * GAIN_ANGULAR
+    //
+    // Then clamp to MAX_LINEAR_VEL / MAX_ANGULAR_VEL.
     // -----------------------------------------------------------------
-    void computeTwist(
-        const Pose & from,
-        const Pose & to,
-        double dt,
+    void computeTwistFromError(
+        const Pose & target,
+        const Pose & current,
         TwistStamped & out)
     {
-        // ---- Linear ----
-        double vx = (to.position.x - from.position.x) / dt;
-        double vy = (to.position.y - from.position.y) / dt;
-        double vz = (to.position.z - from.position.z) / dt;
+        // ---- Linear: position error * gain ----
+        double ex = target.position.x - current.position.x;
+        double ey = target.position.y - current.position.y;
+        double ez = target.position.z - current.position.z;
 
-        // Clamp linear magnitude.
+        double vx = ex * GAIN_LINEAR;
+        double vy = ey * GAIN_LINEAR;
+        double vz = ez * GAIN_LINEAR;
+
         double v_mag = std::sqrt(vx * vx + vy * vy + vz * vz);
         if (v_mag > MAX_LINEAR_VEL) {
             double s = MAX_LINEAR_VEL / v_mag;
@@ -203,33 +211,37 @@ private:
         out.twist.linear.y = vy;
         out.twist.linear.z = vz;
 
-        // ---- Angular ----
-        // q_diff = to * inv(from). Take its axis-angle, convert to angular velocity.
-        tf2::Quaternion q_from(from.orientation.x, from.orientation.y,
-                               from.orientation.z, from.orientation.w);
-        tf2::Quaternion q_to(to.orientation.x, to.orientation.y,
-                             to.orientation.z, to.orientation.w);
-        tf2::Quaternion q_diff = q_to * q_from.inverse();
+        // ---- Angular: orientation error as axis * angle * gain ----
+        tf2::Quaternion q_current(
+            current.orientation.x, current.orientation.y,
+            current.orientation.z, current.orientation.w);
+        tf2::Quaternion q_target(
+            target.orientation.x, target.orientation.y,
+            target.orientation.z, target.orientation.w);
+
+        // q_diff = q_target * inv(q_current). This is the rotation that
+        // takes the arm from current orientation to target orientation.
+        tf2::Quaternion q_diff = q_target * q_current.inverse();
         q_diff.normalize();
 
-        // Convert to axis * angle. Handle sign so we take the shortest path.
+        // Force shortest path (avoid going the long way around).
         if (q_diff.w() < 0.0) {
             q_diff.setValue(-q_diff.x(), -q_diff.y(), -q_diff.z(), -q_diff.w());
         }
+
         double angle = 2.0 * std::acos(std::min(1.0, std::max(-1.0, q_diff.w())));
         double sin_half = std::sqrt(1.0 - q_diff.w() * q_diff.w());
 
         double wx, wy, wz;
         if (sin_half < 1e-6) {
-            // Almost no rotation; angular velocity ~= 0.
+            // Almost no rotation error.
             wx = wy = wz = 0.0;
         } else {
             double ax = q_diff.x() / sin_half;
             double ay = q_diff.y() / sin_half;
             double az = q_diff.z() / sin_half;
-            double w_mag = angle / dt;
+            double w_mag = angle * GAIN_ANGULAR;
 
-            // Clamp angular magnitude.
             if (w_mag > MAX_ANGULAR_VEL) {
                 w_mag = MAX_ANGULAR_VEL;
             }
@@ -251,13 +263,8 @@ private:
     {
         TwistStamped msg;
         msg.header.stamp = node_->now();
-        msg.header.frame_id = ee_frame_;
-        msg.twist.linear.x = 0.0;
-        msg.twist.linear.y = 0.0;
-        msg.twist.linear.z = 0.0;
-        msg.twist.angular.x = 0.0;
-        msg.twist.angular.y = 0.0;
-        msg.twist.angular.z = 0.0;
+        msg.header.frame_id = "base_link";
+        // All twist components default to 0.
         twist_pub_->publish(msg);
     }
 
@@ -282,7 +289,6 @@ private:
                 }
                 anchor_pose_ = arm_->getCurrentPose().pose;
                 anchor_set_ = true;
-                have_last_target_ = false;
                 RCLCPP_INFO(node_->get_logger(),
                     "[%s] grip_start. Anchor at (%.3f, %.3f, %.3f)",
                     arm_group_name_.c_str(),
@@ -300,28 +306,23 @@ private:
 
         // ---- grip_end: stop arm by publishing zero twist ----
         if (frame == "grip_end") {
-            std::lock_guard<std::mutex> lock(anchor_mutex_);
-            anchor_set_ = false;
-            have_last_target_ = false;
+            {
+                std::lock_guard<std::mutex> lock(anchor_mutex_);
+                anchor_set_ = false;
+            }
             publishZeroTwist();
             RCLCPP_INFO(node_->get_logger(),
                 "[%s] grip_end.", arm_group_name_.c_str());
             return;
         }
 
-        // ---- delta: compute target pose, derive twist, publish ----
+        // ---- delta: compute target pose, derive twist from position error ----
         Pose anchor_copy;
         bool have_anchor;
-        Pose last_target_copy;
-        bool have_last_target_copy;
-        rclcpp::Time last_time_copy;
         {
             std::lock_guard<std::mutex> lock(anchor_mutex_);
             have_anchor = anchor_set_;
             anchor_copy = anchor_pose_;
-            have_last_target_copy = have_last_target_;
-            last_target_copy = last_target_;
-            last_time_copy = last_target_time_;
         }
 
         if (!have_anchor) {
@@ -352,46 +353,24 @@ private:
         target.orientation.z = q_target.z();
         target.orientation.w = q_target.w();
 
-        rclcpp::Time now = node_->now();
-
-        // First message after grip_start: no previous target, just remember this one.
-        if (!have_last_target_copy) {
-            std::lock_guard<std::mutex> lock(anchor_mutex_);
-            last_target_ = target;
-            last_target_time_ = now;
-            have_last_target_ = true;
+        // Read the arm's CURRENT EE pose (from CurrentStateMonitor's local cache).
+        Pose current;
+        try {
+            current = arm_->getCurrentPose().pose;
+        } catch (const std::exception & e) {
+            RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                "[%s] getCurrentPose failed: %s",
+                arm_group_name_.c_str(), e.what());
             return;
         }
 
-        double dt = (now - last_time_copy).seconds();
-        if (dt < MIN_DT_SECONDS) {
-            // Too soon since last; messages arriving faster than our dt resolution.
-            // Skip but DO update the "last" so we have a fresh anchor for the next twist.
-            std::lock_guard<std::mutex> lock(anchor_mutex_);
-            last_target_ = target;
-            last_target_time_ = now;
-            return;
-        }
-        if (dt > MAX_DT_SECONDS) {
-            // Too long since last; would compute a runaway twist. Reset and skip.
-            std::lock_guard<std::mutex> lock(anchor_mutex_);
-            last_target_ = target;
-            last_target_time_ = now;
-            return;
-        }
-
-        // Compute twist from last_target -> target over dt.
+        // Build twist from the error (target - current).
         TwistStamped twist_msg;
-        twist_msg.header.stamp = now;
-        twist_msg.header.frame_id = ee_frame_;  // Twist expressed in EE frame for VR feel.
-        computeTwist(last_target_copy, target, dt, twist_msg);
+        twist_msg.header.stamp = node_->now();
+        twist_msg.header.frame_id = "base_link";
+        computeTwistFromError(target, current, twist_msg);
 
         twist_pub_->publish(twist_msg);
-
-        // Remember this target for next iteration's twist computation.
-        std::lock_guard<std::mutex> lock(anchor_mutex_);
-        last_target_ = target;
-        last_target_time_ = now;
     }
 
     void gripperCallback(const Float64::SharedPtr msg)
@@ -439,10 +418,6 @@ private:
     std::mutex anchor_mutex_;
     Pose anchor_pose_;
     bool anchor_set_;
-
-    Pose last_target_;
-    bool have_last_target_;
-    rclcpp::Time last_target_time_;
 
     std::atomic<bool> gripper_busy_;
 };
