@@ -65,7 +65,13 @@ ros2 launch husky_commander husky_vr_teleop.launch.py enable_neck:=false
 ros2 launch husky_commander husky_vr_teleop.launch.py translation_only:=true
 ros2 launch husky_commander husky_vr_teleop.launch.py position_scale:=0.3 smooth_step:=0.05
 ```
+## Setup notes 
 
+Two things are NOT in this repo that you'll need before the launch file works:
+
+**1. Boot scripts on the robot.** The `~/scripts/` directory on the Husky contains `start_cartesian.sh` (the boot helper referenced above) and `generate_cartesian_yaml.py` (the one-time URDF embedder). If they're missing from a fresh robot setup, grab them from the lab Google Drive folder `Husky A200-0876 Backup`. The Drive folder also contains a copy of `robot.yaml` (Clearpath customization) and a clean `control_with_cartesian.yaml.pre_urdf_backup` (used by the generator). Each file has restore instructions in the Drive's `README.md`.
+
+**2. Clearpath workspace + FZI cartesian_controllers must be built from source.** The Husky already has `clearpath_ws` set up with the `a200_0876_customization` package (which declares the dual UR5e arms, RealSenses, etc). The cartesian controllers (`cartesian_motion_controller`, `cartesian_controller_base`, `cartesian_controller_utilities`, etc.) live under `~/ros2_ws/src/cartesian_controllers/` and were cloned from [fzi-forschungszentrum-informatik/cartesian_controllers](https://github.com/fzi-forschungszentrum-informatik/cartesian_controllers) (ros2 branch). If you're setting up a fresh robot, both of these need to be in place before `husky_commander` will build or run.
 ## Dependencies
 
 - ROS 2 Humble
